@@ -1,0 +1,9 @@
+{
+  "name": "mica-theme-setting",
+  "version": "0.1.0",
+  "description": "Native Windows backdrop controls for the Obsidian Mica theme.",
+  "private": true,
+  "scripts": {
+    "check": "node --check main.js"
+  }
+}

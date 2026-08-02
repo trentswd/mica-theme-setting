@@ -1,0 +1,11 @@
+body.mica-theme-setting {
+  --workspace-background-translucent: transparent;
+  --titlebar-background: transparent;
+  --titlebar-background-focused: transparent;
+}
+
+body.mica-theme-setting,
+body.mica-theme-setting .app-container,
+body.mica-theme-setting .horizontal-main-container {
+  background: transparent;
+}

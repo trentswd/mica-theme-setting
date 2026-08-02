@@ -1,0 +1,10 @@
+{
+  "id": "mica-theme-setting",
+  "name": "Mica Theme Setting",
+  "version": "0.1.0",
+  "minAppVersion": "1.13.0",
+  "description": "Applies adjustable native Windows backdrop material to every Obsidian Mica window.",
+  "author": "trentswd",
+  "authorUrl": "https://github.com/trentswd",
+  "isDesktopOnly": true
+}
