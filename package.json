@@ -1,6 +1,6 @@
 {
   "name": "mica-theme-setting",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Native Windows backdrop controls for the Obsidian Mica theme.",
   "private": true,
   "scripts": {

@@ -12,6 +12,9 @@ const MATERIALS = new Set(["mica", "tabbed", "acrylic"]);
 const RESPONSIVE_MIN_ROOT_WIDTH = 320;
 const RESPONSIVE_HYSTERESIS = 32;
 const DEFAULT_SIDEBAR_WIDTH = 300;
+const LIGHT_PREPAINT_COLOR = "#f6f1ee";
+const DARK_PREPAINT_COLOR = "#24211f";
+const TRANSPARENT_WINDOW_COLOR = "#00000000";
 
 function clampNumber(value, min, max, fallback) {
   const number = Number(value);
@@ -26,6 +29,7 @@ class MicaThemeSettingPlugin extends Plugin {
     this.settings.blur = clampNumber(this.settings.blur, 0, 40, DEFAULT_SETTINGS.blur);
     this.decoratedWindows = new Set();
     this.nativeWindowMaterials = new Map();
+    this.nativeWindowHooks = new Map();
     this.autoCollapsedSidebars = { left: false, right: false };
     this.lastSidebarWidths = { left: DEFAULT_SIDEBAR_WIDTH, right: DEFAULT_SIDEBAR_WIDTH };
     this.remote = this.getElectronRemote();
@@ -37,6 +41,7 @@ class MicaThemeSettingPlugin extends Plugin {
       callback: () => {
         this.nativeWindowMaterials.clear();
         this.refreshAllWindows();
+        this.refreshNativeWindowDecorations();
         new Notice("Obsidian Mica material reapplied");
       }
     });
@@ -44,6 +49,8 @@ class MicaThemeSettingPlugin extends Plugin {
     if (!Platform.isWin) {
       return;
     }
+
+    this.registerNativeWindowCreationHook();
 
     this.registerEvent(
       this.app.workspace.on("window-open", (_workspaceWindow, domWindow) => {
@@ -73,6 +80,7 @@ class MicaThemeSettingPlugin extends Plugin {
       this.undecorateDomWindow(domWindow);
     }
     this.clearNativeMaterial();
+    this.removeNativeWindowHooks();
   }
 
   getElectronRemote() {
@@ -97,6 +105,175 @@ class MicaThemeSettingPlugin extends Plugin {
       }
     });
     return windows;
+  }
+
+  registerNativeWindowCreationHook() {
+    const electronApp = this.remote?.app;
+    if (!electronApp?.on) {
+      return;
+    }
+    this.nativeWindowCreatedHandler = (_event, nativeWindow) => {
+      this.prepareNativeWindow(nativeWindow);
+    };
+    electronApp.on("browser-window-created", this.nativeWindowCreatedHandler);
+    this.register(() => {
+      electronApp.removeListener?.("browser-window-created", this.nativeWindowCreatedHandler);
+    });
+  }
+
+  getPrepaintColor() {
+    try {
+      const body = document.body;
+      const computed = body ? window.getComputedStyle(body) : null;
+      const themeColor = computed?.getPropertyValue("--obsidian-mica-glass-fallback")?.trim();
+      if (themeColor && !themeColor.startsWith("var(")) {
+        return themeColor;
+      }
+      return body?.classList.contains("theme-dark") ? DARK_PREPAINT_COLOR : LIGHT_PREPAINT_COLOR;
+    } catch (_error) {
+      return LIGHT_PREPAINT_COLOR;
+    }
+  }
+
+  getNativeDecorationScript() {
+    const materialClass = `obsidian-mica-material-${this.settings.material}`;
+    const tintOpacity = String(this.settings.tintOpacity / 100);
+    const blur = `${this.settings.blur}px`;
+    return `(() => {
+      const body = document.body;
+      if (!body) return false;
+      body.classList.add("is-translucent", "mica-theme-setting");
+      body.classList.remove(
+        "obsidian-mica-material-mica",
+        "obsidian-mica-material-tabbed",
+        "obsidian-mica-material-acrylic"
+      );
+      body.classList.add(${JSON.stringify(materialClass)});
+      body.style.setProperty("--workspace-background-translucent", "transparent");
+      body.style.setProperty("--titlebar-background", "transparent");
+      body.style.setProperty("--titlebar-background-focused", "transparent");
+      body.style.setProperty("--obsidian-mica-glass-opacity", ${JSON.stringify(tintOpacity)});
+      body.style.setProperty("--obsidian-mica-glass-blur", ${JSON.stringify(blur)});
+      void body.offsetWidth;
+      return true;
+    })()`;
+  }
+
+  getNativeUndecorationScript() {
+    return `(() => {
+      const body = document.body;
+      if (!body) return false;
+      body.classList.remove(
+        "mica-theme-setting",
+        "is-translucent",
+        "obsidian-mica-material-mica",
+        "obsidian-mica-material-tabbed",
+        "obsidian-mica-material-acrylic"
+      );
+      body.style.removeProperty("--workspace-background-translucent");
+      body.style.removeProperty("--titlebar-background");
+      body.style.removeProperty("--titlebar-background-focused");
+      body.style.removeProperty("--obsidian-mica-glass-opacity");
+      body.style.removeProperty("--obsidian-mica-glass-blur");
+      return true;
+    })()`;
+  }
+
+  setNativeWindowPrepaint(nativeWindow) {
+    try {
+      nativeWindow.setBackgroundColor?.(this.getPrepaintColor());
+    } catch (error) {
+      console.error("Mica Theme Setting: failed to set window prepaint color", error);
+    }
+  }
+
+  async decorateNativeWindow(nativeWindow, revealMaterial) {
+    const webContents = nativeWindow?.webContents;
+    if (!webContents || webContents.isDestroyed?.()) {
+      return;
+    }
+    try {
+      const decorated = await webContents.executeJavaScript(this.getNativeDecorationScript(), true);
+      if (decorated && revealMaterial && !nativeWindow.isDestroyed()) {
+        nativeWindow.setBackgroundColor?.(TRANSPARENT_WINDOW_COLOR);
+      }
+    } catch (error) {
+      if (!webContents.isDestroyed?.()) {
+        console.error("Mica Theme Setting: failed to decorate window contents", error);
+      }
+    }
+  }
+
+  prepareNativeWindow(nativeWindow) {
+    if (!nativeWindow || nativeWindow.isDestroyed?.()) {
+      return;
+    }
+    const id = nativeWindow.id;
+    this.applyNativeMaterialToWindow(nativeWindow);
+    if (this.nativeWindowHooks.has(id)) {
+      return;
+    }
+    this.setNativeWindowPrepaint(nativeWindow);
+
+    const webContents = nativeWindow.webContents;
+    if (!webContents || webContents.isDestroyed?.()) {
+      return;
+    }
+    const onDidStartNavigation = (_event, _url, _isInPlace, isMainFrame) => {
+      if (isMainFrame !== false) {
+        this.setNativeWindowPrepaint(nativeWindow);
+        this.applyNativeMaterialToWindow(nativeWindow);
+      }
+    };
+    const onDomReady = () => {
+      void this.decorateNativeWindow(nativeWindow, false);
+    };
+    const onDidFinishLoad = () => {
+      if (this.isManagedNativeWindow(nativeWindow)) {
+        void this.decorateNativeWindow(nativeWindow, true);
+      } else {
+        this.removeNativeWindowHook(id);
+        this.nativeWindowMaterials.delete(id);
+        nativeWindow.setBackgroundMaterial?.("none");
+      }
+    };
+    const cleanup = () => this.removeNativeWindowHook(id);
+
+    webContents.on("did-start-navigation", onDidStartNavigation);
+    webContents.on("dom-ready", onDomReady);
+    webContents.on("did-finish-load", onDidFinishLoad);
+    nativeWindow.once("closed", cleanup);
+    this.nativeWindowHooks.set(id, {
+      nativeWindow,
+      webContents,
+      onDidStartNavigation,
+      onDomReady,
+      onDidFinishLoad,
+      cleanup
+    });
+
+    if (!webContents.isLoadingMainFrame?.()) {
+      void this.decorateNativeWindow(nativeWindow, true);
+    }
+  }
+
+  removeNativeWindowHook(id) {
+    const hook = this.nativeWindowHooks.get(id);
+    if (!hook) {
+      return;
+    }
+    hook.webContents.removeListener?.("did-start-navigation", hook.onDidStartNavigation);
+    hook.webContents.removeListener?.("dom-ready", hook.onDomReady);
+    hook.webContents.removeListener?.("did-finish-load", hook.onDidFinishLoad);
+    hook.nativeWindow.removeListener?.("closed", hook.cleanup);
+    this.nativeWindowHooks.delete(id);
+    this.nativeWindowMaterials.delete(id);
+  }
+
+  removeNativeWindowHooks() {
+    for (const id of Array.from(this.nativeWindowHooks.keys())) {
+      this.removeNativeWindowHook(id);
+    }
   }
 
   decorateDomWindow(domWindow) {
@@ -140,38 +317,54 @@ class MicaThemeSettingPlugin extends Plugin {
       if (!BrowserWindow) {
         return [];
       }
-      return BrowserWindow.getAllWindows().filter(nativeWindow => {
-        if (nativeWindow.isDestroyed()) {
-          return false;
-        }
-        const url = nativeWindow.webContents?.getURL?.() ?? "";
-        const title = nativeWindow.getTitle?.() ?? "";
-        return url.startsWith("app://obsidian.md") || url === "about:blank" || title.includes("Obsidian");
-      });
+      return BrowserWindow.getAllWindows().filter(nativeWindow => this.isManagedNativeWindow(nativeWindow));
     } catch (error) {
       console.error("Mica Theme Setting: failed to enumerate native windows", error);
       return [];
     }
   }
 
+  isManagedNativeWindow(nativeWindow) {
+    if (!nativeWindow || nativeWindow.isDestroyed?.()) {
+      return false;
+    }
+    const url = nativeWindow.webContents?.getURL?.() ?? "";
+    const title = nativeWindow.getTitle?.() ?? "";
+    return url.startsWith("app://obsidian.md") || url === "about:blank" || title.includes("Obsidian");
+  }
+
   applyNativeMaterial() {
     for (const nativeWindow of this.getNativeWindows()) {
-      try {
-        const id = nativeWindow.id;
-        if (this.nativeWindowMaterials.get(id) === this.settings.material) {
-          continue;
-        }
-        nativeWindow.setBackgroundMaterial?.(this.settings.material);
-        this.nativeWindowMaterials.set(id, this.settings.material);
-      } catch (error) {
-        console.error("Mica Theme Setting: failed to apply native material", error);
+      this.prepareNativeWindow(nativeWindow);
+    }
+  }
+
+  refreshNativeWindowDecorations() {
+    for (const nativeWindow of this.getNativeWindows()) {
+      if (!nativeWindow.webContents?.isLoadingMainFrame?.()) {
+        void this.decorateNativeWindow(nativeWindow, true);
       }
+    }
+  }
+
+  applyNativeMaterialToWindow(nativeWindow) {
+    try {
+      const id = nativeWindow.id;
+      if (this.nativeWindowMaterials.get(id) === this.settings.material) {
+        return;
+      }
+      nativeWindow.setBackgroundMaterial?.(this.settings.material);
+      this.nativeWindowMaterials.set(id, this.settings.material);
+    } catch (error) {
+      console.error("Mica Theme Setting: failed to apply native material", error);
     }
   }
 
   clearNativeMaterial() {
     for (const nativeWindow of this.getNativeWindows()) {
       try {
+        void nativeWindow.webContents?.executeJavaScript?.(this.getNativeUndecorationScript(), true);
+        nativeWindow.setBackgroundColor?.(this.getPrepaintColor());
         nativeWindow.setBackgroundMaterial?.("none");
       } catch (error) {
         console.error("Mica Theme Setting: failed to clear native material", error);
@@ -281,18 +474,21 @@ class MicaThemeSettingPlugin extends Plugin {
     await this.saveSettings();
     this.nativeWindowMaterials.clear();
     this.refreshAllWindows();
+    this.refreshNativeWindowDecorations();
   }
 
   async setTintOpacity(tintOpacity) {
     this.settings.tintOpacity = clampNumber(tintOpacity, 0, 100, DEFAULT_SETTINGS.tintOpacity);
     await this.saveSettings();
     this.refreshAllWindows();
+    this.refreshNativeWindowDecorations();
   }
 
   async setBlur(blur) {
     this.settings.blur = clampNumber(blur, 0, 40, DEFAULT_SETTINGS.blur);
     await this.saveSettings();
     this.refreshAllWindows();
+    this.refreshNativeWindowDecorations();
   }
 }
 
