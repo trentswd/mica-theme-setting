@@ -7,6 +7,7 @@ Mica Theme Setting is the desktop companion for [Obsidian Mica](https://github.c
 - Mica, Mica Alt, Acrylic, and solid fallback modes.
 - Native material applied consistently to current and future Obsidian windows.
 - Acrylic tint opacity and additional CSS blur controls.
+- True overlay scrollbars for the main window and later pop-out windows, with draggable Windows-style thumbs.
 - Automatic cleanup when the plugin is disabled.
 - Windows-only behavior; unsupported platforms keep their normal opaque surface.
 

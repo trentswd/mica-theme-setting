@@ -15,10 +15,210 @@ const DEFAULT_SIDEBAR_WIDTH = 300;
 const LIGHT_PREPAINT_COLOR = "#f6f1ee";
 const DARK_PREPAINT_COLOR = "#24211f";
 const TRANSPARENT_WINDOW_COLOR = "#00000000";
+const OVERLAY_SCROLLBAR_MIN_THUMB = 24;
 
 function clampNumber(value, min, max, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback;
+}
+
+class OverlayScrollbarController {
+  constructor(domWindow) {
+    this.domWindow = domWindow;
+    this.document = domWindow.document;
+    this.entries = new Map();
+    this.scanTimers = [];
+    this.onResize = () => this.updateAll();
+    this.onPointerOver = event => this.discoverFromPath(event.composedPath?.() ?? []);
+  }
+
+  start() {
+    this.domWindow.addEventListener("resize", this.onResize);
+    this.document.addEventListener("pointerover", this.onPointerOver, true);
+    this.scan();
+    for (const delay of [0, 250, 1000, 2500]) {
+      this.scanTimers.push(this.domWindow.setTimeout(() => this.scan(), delay));
+    }
+  }
+
+  stop() {
+    this.domWindow.removeEventListener("resize", this.onResize);
+    this.document.removeEventListener("pointerover", this.onPointerOver, true);
+    for (const timer of this.scanTimers) {
+      this.domWindow.clearTimeout(timer);
+    }
+    this.scanTimers.length = 0;
+    for (const source of Array.from(this.entries.keys())) {
+      this.remove(source);
+    }
+  }
+
+  isScrollable(element) {
+    if (
+      !element ||
+      element.nodeType !== 1 ||
+      element.ownerDocument !== this.document ||
+      element.scrollHeight <= element.clientHeight + 1
+    ) {
+      return false;
+    }
+    const overflowY = this.domWindow.getComputedStyle(element).overflowY;
+    return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+  }
+
+  discoverFromPath(path) {
+    for (const element of path) {
+      if (this.isScrollable(element)) {
+        this.add(element);
+        return;
+      }
+    }
+  }
+
+  scan() {
+    const roots = this.document.querySelectorAll(".workspace, .modal-container, .prompt, .suggestion-container");
+    for (const root of roots) {
+      if (this.isScrollable(root)) {
+        this.add(root);
+      }
+      for (const element of root.querySelectorAll("*")) {
+        if (this.isScrollable(element)) {
+          this.add(element);
+        }
+      }
+    }
+    this.updateAll();
+  }
+
+  add(source) {
+    if (this.entries.has(source)) {
+      return;
+    }
+
+    const track = this.document.createElement("div");
+    track.className = "mica-overlay-scrollbar";
+    track.setAttribute("aria-hidden", "true");
+    const thumb = this.document.createElement("div");
+    thumb.className = "mica-overlay-scrollbar-thumb";
+    track.appendChild(thumb);
+    this.document.body.appendChild(track);
+    source.classList.add("mica-overlay-scrollbar-source");
+
+    const entry = {
+      source,
+      track,
+      thumb,
+      dragging: false,
+      startY: 0,
+      startScrollTop: 0,
+      scroll: () => this.update(source),
+      pointerDown: event => this.onPointerDown(event, source),
+      pointerMove: event => this.onPointerMove(event, source),
+      pointerUp: event => this.onPointerUp(event, source)
+    };
+    source.addEventListener("scroll", entry.scroll, { passive: true });
+    track.addEventListener("pointerdown", entry.pointerDown);
+    track.addEventListener("pointermove", entry.pointerMove);
+    track.addEventListener("pointerup", entry.pointerUp);
+    track.addEventListener("pointercancel", entry.pointerUp);
+    this.entries.set(source, entry);
+    this.update(source);
+  }
+
+  remove(source) {
+    const entry = this.entries.get(source);
+    if (!entry) {
+      return;
+    }
+    source.removeEventListener("scroll", entry.scroll);
+    source.classList.remove("mica-overlay-scrollbar-source");
+    entry.track.remove();
+    this.entries.delete(source);
+  }
+
+  updateAll() {
+    for (const source of Array.from(this.entries.keys())) {
+      if (!source.isConnected) {
+        this.remove(source);
+      } else {
+        this.update(source);
+      }
+    }
+  }
+
+  update(source) {
+    const entry = this.entries.get(source);
+    if (!entry) {
+      return;
+    }
+    const rect = source.getBoundingClientRect();
+    const top = Math.max(0, rect.top);
+    const bottom = Math.min(this.domWindow.innerHeight, rect.bottom);
+    const height = Math.max(0, bottom - top);
+    const maxScroll = source.scrollHeight - source.clientHeight;
+    const visible = height > 0 && rect.width > 0 && maxScroll > 0;
+    entry.track.classList.toggle("is-visible", visible);
+    if (!visible) {
+      return;
+    }
+
+    const thumbHeight = Math.max(
+      OVERLAY_SCROLLBAR_MIN_THUMB,
+      Math.min(height, height * source.clientHeight / source.scrollHeight)
+    );
+    const travel = Math.max(0, height - thumbHeight);
+    const thumbTop = maxScroll > 0 ? travel * source.scrollTop / maxScroll : 0;
+    entry.track.style.top = `${top}px`;
+    entry.track.style.right = `${Math.max(0, this.domWindow.innerWidth - rect.right)}px`;
+    entry.track.style.height = `${height}px`;
+    entry.thumb.style.height = `${thumbHeight}px`;
+    entry.thumb.style.transform = `translateY(${thumbTop}px)`;
+  }
+
+  onPointerDown(event, source) {
+    const entry = this.entries.get(source);
+    if (!entry || event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.target !== entry.thumb) {
+      const sourceRect = source.getBoundingClientRect();
+      const direction = event.clientY < entry.thumb.getBoundingClientRect().top ? -1 : 1;
+      source.scrollBy({ top: direction * sourceRect.height * 0.85, behavior: "auto" });
+      return;
+    }
+    entry.dragging = true;
+    entry.startY = event.clientY;
+    entry.startScrollTop = source.scrollTop;
+    entry.track.classList.add("is-dragging");
+    entry.track.setPointerCapture(event.pointerId);
+  }
+
+  onPointerMove(event, source) {
+    const entry = this.entries.get(source);
+    if (!entry?.dragging) {
+      return;
+    }
+    event.preventDefault();
+    const trackHeight = entry.track.getBoundingClientRect().height;
+    const thumbHeight = entry.thumb.getBoundingClientRect().height;
+    const travel = Math.max(1, trackHeight - thumbHeight);
+    const maxScroll = Math.max(0, source.scrollHeight - source.clientHeight);
+    source.scrollTop = entry.startScrollTop + (event.clientY - entry.startY) * maxScroll / travel;
+  }
+
+  onPointerUp(event, source) {
+    const entry = this.entries.get(source);
+    if (!entry?.dragging) {
+      return;
+    }
+    entry.dragging = false;
+    entry.track.classList.remove("is-dragging");
+    if (entry.track.hasPointerCapture(event.pointerId)) {
+      entry.track.releasePointerCapture(event.pointerId);
+    }
+  }
 }
 
 class MicaThemeSettingPlugin extends Plugin {
@@ -30,6 +230,7 @@ class MicaThemeSettingPlugin extends Plugin {
     this.decoratedWindows = new Set();
     this.nativeWindowMaterials = new Map();
     this.nativeWindowHooks = new Map();
+    this.overlayScrollbarControllers = new Map();
     this.autoCollapsedSidebars = { left: false, right: false };
     this.lastSidebarWidths = { left: DEFAULT_SIDEBAR_WIDTH, right: DEFAULT_SIDEBAR_WIDTH };
     this.remote = this.getElectronRemote();
@@ -66,7 +267,12 @@ class MicaThemeSettingPlugin extends Plugin {
         this.undecorateDomWindow(domWindow);
       })
     );
-    this.registerEvent(this.app.workspace.on("layout-change", () => this.refreshAllWindows()));
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => {
+        this.refreshAllWindows();
+        this.scanOverlayScrollbars();
+      })
+    );
     this.registerInterval(window.setInterval(() => this.refreshAllWindows(), 750));
     this.app.workspace.onLayoutReady(() => {
       this.registerDomEvent(this.getWorkspaceWindow(), "resize", () => this.updateResponsiveSidebars());
@@ -81,6 +287,10 @@ class MicaThemeSettingPlugin extends Plugin {
     }
     this.clearNativeMaterial();
     this.removeNativeWindowHooks();
+    for (const controller of this.overlayScrollbarControllers.values()) {
+      controller.stop();
+    }
+    this.overlayScrollbarControllers.clear();
   }
 
   getElectronRemote() {
@@ -289,6 +499,11 @@ class MicaThemeSettingPlugin extends Plugin {
     body.style.setProperty("--titlebar-background-focused", "transparent");
     body.style.setProperty("--obsidian-mica-glass-opacity", String(this.settings.tintOpacity / 100));
     body.style.setProperty("--obsidian-mica-glass-blur", `${this.settings.blur}px`);
+    if (!this.overlayScrollbarControllers.has(domWindow)) {
+      const controller = new OverlayScrollbarController(domWindow);
+      this.overlayScrollbarControllers.set(domWindow, controller);
+      controller.start();
+    }
     this.decoratedWindows.add(domWindow);
   }
 
@@ -308,6 +523,8 @@ class MicaThemeSettingPlugin extends Plugin {
       body.style.removeProperty("--obsidian-mica-glass-opacity");
       body.style.removeProperty("--obsidian-mica-glass-blur");
     }
+    this.overlayScrollbarControllers.get(domWindow)?.stop();
+    this.overlayScrollbarControllers.delete(domWindow);
     this.decoratedWindows.delete(domWindow);
   }
 
@@ -382,6 +599,21 @@ class MicaThemeSettingPlugin extends Plugin {
     }
     this.applyNativeMaterial();
     this.updateResponsiveSidebars();
+    for (const controller of this.overlayScrollbarControllers.values()) {
+      if (controller.entries.size === 0) {
+        controller.scan();
+      } else {
+        controller.updateAll();
+      }
+    }
+  }
+
+  scanOverlayScrollbars() {
+    window.setTimeout(() => {
+      for (const controller of this.overlayScrollbarControllers.values()) {
+        controller.scan();
+      }
+    }, 0);
   }
 
   getWorkspaceWindow() {

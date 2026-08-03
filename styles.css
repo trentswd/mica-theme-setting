@@ -9,3 +9,38 @@ body.mica-theme-setting .app-container,
 body.mica-theme-setting .horizontal-main-container {
   background: transparent;
 }
+
+body.mod-windows:not(.is-mobile).styled-scrollbars.mica-theme-setting
+  .mica-overlay-scrollbar-source::-webkit-scrollbar {
+  width: 0;
+  height: 10px;
+}
+
+.mica-overlay-scrollbar {
+  position: fixed;
+  z-index: var(--layer-popover, 1000);
+  display: none;
+  width: 10px;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+body.mica-theme-setting.styled-scrollbars > .mica-overlay-scrollbar.is-visible {
+  display: block;
+}
+
+.mica-overlay-scrollbar-thumb {
+  position: absolute;
+  right: 1px;
+  width: 2px;
+  min-height: 24px;
+  border-radius: 999px;
+  background-color: var(--obsidian-mica-overlay-scrollbar-thumb, rgb(96 96 96 / 52%));
+  transition: width 120ms ease, background-color 120ms ease;
+}
+
+.mica-overlay-scrollbar:hover .mica-overlay-scrollbar-thumb,
+.mica-overlay-scrollbar.is-dragging .mica-overlay-scrollbar-thumb {
+  width: 6px;
+  background-color: var(--obsidian-mica-overlay-scrollbar-thumb-hover, rgb(64 64 64 / 68%));
+}
