@@ -9,13 +9,15 @@ const DEFAULT_SETTINGS = {
 };
 
 const MATERIALS = new Set(["mica", "tabbed", "acrylic"]);
-const RESPONSIVE_MIN_ROOT_WIDTH = 320;
+const RESPONSIVE_MIN_ROOT_WIDTH = 400;
 const RESPONSIVE_HYSTERESIS = 32;
 const DEFAULT_SIDEBAR_WIDTH = 300;
 const LIGHT_PREPAINT_COLOR = "#f6f1ee";
 const DARK_PREPAINT_COLOR = "#24211f";
 const TRANSPARENT_WINDOW_COLOR = "#00000000";
 const OVERLAY_SCROLLBAR_MIN_THUMB = 24;
+const OVERLAY_SCROLLBAR_RESIZE_SETTLE_MS = 240;
+const OVERLAY_SCROLLBAR_EDGE_GAP = 6;
 
 function clampNumber(value, min, max, fallback) {
   const number = Number(value);
@@ -28,7 +30,9 @@ class OverlayScrollbarController {
     this.document = domWindow.document;
     this.entries = new Map();
     this.scanTimers = [];
-    this.onResize = () => this.updateAll();
+    this.resizeTimer = 0;
+    this.resizeActive = false;
+    this.onResize = () => this.handleResize();
     this.onPointerOver = event => this.discoverFromPath(event.composedPath?.() ?? []);
   }
 
@@ -48,9 +52,29 @@ class OverlayScrollbarController {
       this.domWindow.clearTimeout(timer);
     }
     this.scanTimers.length = 0;
+    if (this.resizeTimer) {
+      this.domWindow.clearTimeout(this.resizeTimer);
+      this.resizeTimer = 0;
+    }
+    this.resizeActive = false;
     for (const source of Array.from(this.entries.keys())) {
       this.remove(source);
     }
+  }
+
+  handleResize() {
+    this.resizeActive = true;
+    for (const entry of this.entries.values()) {
+      entry.track.classList.remove("is-visible");
+    }
+    if (this.resizeTimer) {
+      this.domWindow.clearTimeout(this.resizeTimer);
+    }
+    this.resizeTimer = this.domWindow.setTimeout(() => {
+      this.resizeTimer = 0;
+      this.resizeActive = false;
+      this.updateAll();
+    }, OVERLAY_SCROLLBAR_RESIZE_SETTLE_MS);
   }
 
   isScrollable(element) {
@@ -151,12 +175,39 @@ class OverlayScrollbarController {
     if (!entry) {
       return;
     }
+    if (this.resizeActive && !entry.dragging) {
+      entry.track.classList.remove("is-visible");
+      return;
+    }
     const rect = source.getBoundingClientRect();
-    const top = Math.max(0, rect.top);
-    const bottom = Math.min(this.domWindow.innerHeight, rect.bottom);
+    const clippingContainer = source.closest(
+      ".workspace-split, .nn-companion-sidebar, .modal-container, .prompt, .suggestion-container"
+    );
+    const clipRect = clippingContainer?.getBoundingClientRect();
+    let top = Math.max(0, rect.top, clipRect?.top ?? 0);
+    const right = Math.min(this.domWindow.innerWidth, rect.right, clipRect?.right ?? this.domWindow.innerWidth);
+    let bottom = Math.min(
+      this.domWindow.innerHeight,
+      rect.bottom,
+      clipRect?.bottom ?? this.domWindow.innerHeight
+    );
+    const left = Math.max(0, rect.left, clipRect?.left ?? 0);
+    if (clippingContainer?.classList.contains("mod-root")) {
+      const viewHeader = source.closest(".workspace-leaf")?.querySelector(".view-header");
+      const viewHeaderBottom = viewHeader?.getBoundingClientRect().bottom;
+      if (Number.isFinite(viewHeaderBottom)) {
+        top = Math.max(top, viewHeaderBottom);
+      }
+    }
+    top += OVERLAY_SCROLLBAR_EDGE_GAP;
+    bottom -= OVERLAY_SCROLLBAR_EDGE_GAP;
+    const width = Math.max(0, right - left);
     const height = Math.max(0, bottom - top);
     const maxScroll = source.scrollHeight - source.clientHeight;
-    const visible = height > 0 && rect.width > 0 && maxScroll > 0;
+    const rootIsUsable =
+      !clippingContainer?.classList.contains("mod-root") ||
+      (clipRect?.width ?? 0) >= RESPONSIVE_MIN_ROOT_WIDTH;
+    const visible = rootIsUsable && height > 0 && width > 1 && maxScroll > 0;
     entry.track.classList.toggle("is-visible", visible);
     if (!visible) {
       return;
@@ -169,7 +220,7 @@ class OverlayScrollbarController {
     const travel = Math.max(0, height - thumbHeight);
     const thumbTop = maxScroll > 0 ? travel * source.scrollTop / maxScroll : 0;
     entry.track.style.top = `${top}px`;
-    entry.track.style.right = `${Math.max(0, this.domWindow.innerWidth - rect.right)}px`;
+    entry.track.style.right = `${Math.max(0, this.domWindow.innerWidth - right)}px`;
     entry.track.style.height = `${height}px`;
     entry.thumb.style.height = `${thumbHeight}px`;
     entry.thumb.style.transform = `translateY(${thumbTop}px)`;
@@ -233,6 +284,7 @@ class MicaThemeSettingPlugin extends Plugin {
     this.overlayScrollbarControllers = new Map();
     this.autoCollapsedSidebars = { left: false, right: false };
     this.lastSidebarWidths = { left: DEFAULT_SIDEBAR_WIDTH, right: DEFAULT_SIDEBAR_WIDTH };
+    this.responsiveRootObserver = null;
     this.remote = this.getElectronRemote();
 
     this.addSettingTab(new MicaThemeSettingTab(this.app, this));
@@ -276,11 +328,14 @@ class MicaThemeSettingPlugin extends Plugin {
     this.registerInterval(window.setInterval(() => this.refreshAllWindows(), 750));
     this.app.workspace.onLayoutReady(() => {
       this.registerDomEvent(this.getWorkspaceWindow(), "resize", () => this.updateResponsiveSidebars());
+      this.observeResponsiveRoot();
       this.refreshAllWindows();
     });
   }
 
   onunload() {
+    this.responsiveRootObserver?.disconnect();
+    this.responsiveRootObserver = null;
     this.restoreResponsiveSidebars();
     for (const domWindow of this.decoratedWindows) {
       this.undecorateDomWindow(domWindow);
@@ -620,9 +675,18 @@ class MicaThemeSettingPlugin extends Plugin {
     return this.app.workspace.rootSplit?.containerEl?.ownerDocument?.defaultView ?? window;
   }
 
-  getRibbonWidth(domWindow) {
-    const ribbon = domWindow.document.querySelector(".workspace-ribbon.mod-left");
-    return ribbon instanceof HTMLElement ? ribbon.getBoundingClientRect().width : 0;
+  observeResponsiveRoot() {
+    const rootElement = this.app.workspace.rootSplit?.containerEl;
+    const workspaceWindow = rootElement?.ownerDocument?.defaultView;
+    if (!rootElement || !workspaceWindow?.ResizeObserver) {
+      return;
+    }
+
+    this.responsiveRootObserver?.disconnect();
+    this.responsiveRootObserver = new workspaceWindow.ResizeObserver(() => {
+      this.updateResponsiveSidebars();
+    });
+    this.responsiveRootObserver.observe(rootElement);
   }
 
   rememberSidebarWidth(side, split) {
@@ -636,6 +700,32 @@ class MicaThemeSettingPlugin extends Plugin {
       this.lastSidebarWidths[side] = width;
     }
     return this.lastSidebarWidths[side];
+  }
+
+  getCompanionSidebarWidth(domWindow) {
+    const companion = domWindow.document.querySelector(".nn-companion-sidebar");
+    if (!(companion instanceof domWindow.HTMLElement)) {
+      return 0;
+    }
+    if (companion.classList.contains("nn-companion-sidebar-inactive")) {
+      return 0;
+    }
+
+    const renderedWidth = companion.getBoundingClientRect().width;
+    const configuredWidth = Number.parseFloat(
+      domWindow.getComputedStyle(companion).getPropertyValue("--nn-companion-sidebar-width")
+    );
+    return Math.max(renderedWidth, Number.isFinite(configuredWidth) ? configuredWidth : 0);
+  }
+
+  getVisibleSplitWidth(domWindow, split) {
+    const rect = split.containerEl?.getBoundingClientRect?.();
+    if (!rect) {
+      return 0;
+    }
+    const left = Math.max(0, rect.left);
+    const right = Math.min(domWindow.innerWidth, rect.right);
+    return Math.max(0, right - left);
   }
 
   collapseSidebar(side, split) {
@@ -660,31 +750,52 @@ class MicaThemeSettingPlugin extends Plugin {
     if (!Platform.isWin || workspaceWindow.innerWidth <= 0) {
       return;
     }
-    const { leftSplit, rightSplit } = this.app.workspace;
-    if (!leftSplit || !rightSplit) {
+    const { leftSplit, rightSplit, rootSplit } = this.app.workspace;
+    if (!leftSplit || !rightSplit || !rootSplit) {
       return;
     }
 
     const leftWidth = this.rememberSidebarWidth("left", leftSplit);
     const rightWidth = this.rememberSidebarWidth("right", rightSplit);
-    const leftThreshold = this.getRibbonWidth(workspaceWindow) + leftWidth + RESPONSIVE_MIN_ROOT_WIDTH;
-    const rightThreshold = leftThreshold + rightWidth;
-    const windowWidth = workspaceWindow.innerWidth;
+    const companionWidth = this.getCompanionSidebarWidth(workspaceWindow);
+    const visibleRightWidth = this.getVisibleSplitWidth(workspaceWindow, rightSplit);
+    const rootWidth = rootSplit.containerEl?.getBoundingClientRect?.().width ?? 0;
+    if (!Number.isFinite(rootWidth)) {
+      return;
+    }
 
-    if (windowWidth < leftThreshold) {
-      this.collapseSidebar("right", rightSplit);
+    if (rootWidth < RESPONSIVE_MIN_ROOT_WIDTH) {
+      if (!rightSplit.collapsed) {
+        const rootWidthAfterRightCollapse = rootWidth + visibleRightWidth;
+        this.collapseSidebar("right", rightSplit);
+        if (rootWidthAfterRightCollapse < RESPONSIVE_MIN_ROOT_WIDTH) {
+          this.collapseSidebar("left", leftSplit);
+        }
+        return;
+      }
+      if (
+        this.autoCollapsedSidebars.right &&
+        rootWidth + visibleRightWidth >= RESPONSIVE_MIN_ROOT_WIDTH
+      ) {
+        return;
+      }
       this.collapseSidebar("left", leftSplit);
       return;
     }
 
-    if (windowWidth >= leftThreshold + RESPONSIVE_HYSTERESIS) {
-      this.restoreSidebar("left", leftSplit);
+    if (this.autoCollapsedSidebars.left) {
+      const restoredRootWidth = rootWidth - leftWidth - companionWidth;
+      if (restoredRootWidth >= RESPONSIVE_MIN_ROOT_WIDTH + RESPONSIVE_HYSTERESIS) {
+        this.restoreSidebar("left", leftSplit);
+      }
+      return;
     }
 
-    if (windowWidth < rightThreshold) {
-      this.collapseSidebar("right", rightSplit);
-    } else if (windowWidth >= rightThreshold + RESPONSIVE_HYSTERESIS) {
-      this.restoreSidebar("right", rightSplit);
+    if (this.autoCollapsedSidebars.right) {
+      const restoredRootWidth = rootWidth - rightWidth;
+      if (restoredRootWidth >= RESPONSIVE_MIN_ROOT_WIDTH + RESPONSIVE_HYSTERESIS) {
+        this.restoreSidebar("right", rightSplit);
+      }
     }
   }
 
